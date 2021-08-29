@@ -1,21 +1,27 @@
-# Copyright 2021 Nathan Nguyen
+# 2021 Nathan Nguyen
 #
 # CONCEPT:
-# On a grid, there are two bombs (red), two civilians(green), and one player(blue).
+# On a grid, there are two bombs (red), one civilian (green), and one player (blue).
 # When the timer runs out, the bombs blow up the surrounding area.
 # By this time, the player must find the civilians and leave the danger area.
+#
+# Run this file to play BombsQQ.
+# Controls: move with the WASD or arrow keys
 
 import pygame
 import random
 from enum import Enum
 from collections import namedtuple
+import numpy as np
 
 pygame.init()
-font = pygame.font.SysFont('arial', 18)
+font = pygame.font.SysFont("arial", 18)
 
-Point = namedtuple('Point', 'x, y')
+# Defines a square on the grid. The top left square is (0,0) while the bottom right
+# is (6,6)
+Point = namedtuple("Point", "x, y")
 
-# rgb colors
+# RGB colors
 BLUE = (77, 186, 240)
 RED = (246, 62, 80)
 GREEN = (57, 212, 98)
@@ -25,19 +31,28 @@ GRID = (136, 255, 142)
 PURPLE = (161, 60, 255)
 
 BLOCK_SIZE = 50
+GRID_SIZE = 7
 
 # frame rate
 SPEED = 30
 
 # number of each item
 NUM_BOMBS = 2
-NUM_BONUSES = 2
+NUM_BONUSES = 1  # changing this will break training state implementation
 
 BOMB_RADIUS = 2
 
 # time per round in milliseconds
-TOTAL_TIME = 3000
+TOTAL_TIME = 2000
 
+# actions determined by agent
+ACTION_STAY = [1, 0, 0, 0, 0]
+ACTION_LEFT = [0, 1, 0, 0, 0]
+ACTION_RIGHT = [0, 0, 1, 0, 0]
+ACTION_DOWN = [0, 0, 0, 1, 0]
+ACTION_UP = [0, 0, 0, 0, 1]
+
+# Describes the player's movement.
 class Direction(Enum):
   RIGHT = 1
   LEFT = 2
@@ -46,26 +61,31 @@ class Direction(Enum):
 
 class Game:
 
-  def __init__(self, w=350, h=350):
+  def __init__(self, w=350, h=350, training=True):
     self.w = w
     self.h = h
+    self.training = training  # false when game is human controlled
 
     # display preferences
     self.display = pygame.display.set_mode((self.w, self.h))
-    pygame.display.set_caption('Bombs QQ')
+    pygame.display.set_caption("BombsQQ")
     self.clock = pygame.time.Clock()
 
-    # game state
+    # initializes game state
+    self.reset()
 
-    # player location
-    location = Point((self.w / 2) - (BLOCK_SIZE / 2),
-      (self.h / 2) - (BLOCK_SIZE / 2))
+  # resets game to original state
+  def reset(self):
+    # player location in center of grid
 
     # locations for bombs, bonuses, and player
     # first NUM_BOMBS entries are bombs
     # next NUM_BONUSES entries are bonuses (civilians)
     # player is always the last entry
-    self.locations = [None, None, None, None, location]
+    location = Point((self.w / 2) - (BLOCK_SIZE / 2),
+      (self.h / 2) - (BLOCK_SIZE / 2))
+    self.locations = [None] * (NUM_BOMBS + NUM_BONUSES)
+    self.locations.append(location)
     
     self.direction = None
     self.score = 0
@@ -78,8 +98,10 @@ class Game:
 
   # places items in random locations
   def _place_items(self):
-    self.locations = [None, None, None, None, self._get_player_loc()]
-    for i in range(4):
+    player_loc = self.get_player_loc()
+    self.locations = [None] * (NUM_BOMBS + NUM_BONUSES)
+    self.locations.append(player_loc)
+    for i in range(len(self.locations) - 1):
       new_loc = None
 
       # search for location that does not overlap with other element
@@ -91,12 +113,46 @@ class Game:
       # save new unique location
       self.locations[i] = new_loc
 
+    # try again if the grid is in an illegal state:
+    # all three items (2 bombs and player/bonus) are in a
+    # corner and the corner element is a bonus or the player
+    redo = False
+    for i in range(NUM_BOMBS, len(self.locations)):
+      if self._is_blocked(self.locations[i]):
+        redo = True
+        break
+
+    if redo:
+      self._place_items()
+
+  # returns true if the point is surrounded by bombs/walls
+  def _is_blocked(self, pt):
+    surrounding = [Point(pt.x - BLOCK_SIZE, pt.y),
+                  Point(pt.x + BLOCK_SIZE, pt.y),
+                  Point(pt.x, pt.y - BLOCK_SIZE),
+                  Point(pt.x, pt.y + BLOCK_SIZE)]
+
+    for square in surrounding:
+      if not (self.has_bomb(square) or square.x < 0 or
+        square.x >= self.w or square.y < 0 or square.y >= self.h):
+        return False
+
+    return True
+
+  # returns true iff there is a bomb at the given point
+  def has_bomb(self, pt):
+    for i in range(0, NUM_BOMBS):
+      if self.locations[i] == pt:
+        return True
+
+    return False
+
   # returns the player's current location
-  def _get_player_loc(self):
-    return self.locations[len(self.locations) - 1]
+  def get_player_loc(self):
+    return self.locations[-1]
 
   # executes every frame
-  def play_step(self):
+  def play_step(self, action):
     game_over = False
 
     # get user input
@@ -105,7 +161,7 @@ class Game:
         pygame.quit()
         quit()
 
-      if event.type == pygame.KEYDOWN:
+      if not self.training and event.type == pygame.KEYDOWN:
         if event.key == pygame.K_w or event.key == pygame.K_UP:
           self.direction = Direction.UP
         elif event.key == pygame.K_a or event.key == pygame.K_LEFT:
@@ -114,81 +170,111 @@ class Game:
           self.direction = Direction.DOWN
         elif event.key == pygame.K_d or event.key == pygame.K_RIGHT:
           self.direction = Direction.RIGHT
-        elif event.key == pygame.K_SPACE:
-          self._place_items()
-      # elif event.type == pygame.KEYUP:
-      #   self.direction = None
 
-    self._move()
-    self._check_bonus()
+    move_reward = self._move(action)
+    bonus_reward = self._check_bonus()
 
-    game_over = self._check_time()
+    game_over, reward = self._check_time()
+    reward += bonus_reward
+    reward += move_reward
     self._update_ui()
     self.clock.tick(SPEED)
 
-    return game_over, self.score
+    return game_over, self.score, reward
 
   # decrements timer and checks for winning round
-  # returns true iff game is lost
+  # returns true iff game is lost and the reward
   def _check_time(self):
+    reward = 0
     self.timer -= self.clock.get_time()
 
     if self.timer <= 0:
       self.timer = 0
-      if self.num_collected == NUM_BONUSES and\
-        not self._near_bomb(self._get_player_loc()):
+
+      # reward for ending on a safe square
+      if not self.near_bomb(self.get_player_loc()):
+        reward += 5
+
+      if (self.num_collected == NUM_BONUSES and
+        not self.near_bomb(self.get_player_loc())):
         # won round, reset
         self.score += 1
         self.timer = TOTAL_TIME
         self.num_collected = 0
         self._place_items()
-        return False
+        reward += 10
+        return False, reward
       # lost round
-      return True
+      reward -= 20
+      return True, reward
     
-    return False
+    return False, reward
 
 
   # checks if player is on bonus
+  # returns reward for getting bonus
   def _check_bonus(self):
+    reward = 0
     for i in range(NUM_BOMBS, NUM_BOMBS + NUM_BONUSES):
       if self.locations[i] != None and\
-        self.locations[i].x == self._get_player_loc().x and\
-        self.locations[i].y == self._get_player_loc().y:
+        self.locations[i].x == self.get_player_loc().x and\
+        self.locations[i].y == self.get_player_loc().y:
         self.num_collected += 1
         self.locations[i] = None
+        reward += 10
+
+    return reward
 
 
   # moves the player
-  def _move(self):
-    x = self._get_player_loc().x
-    y = self._get_player_loc().y
+  def _move(self, action):
+    reward = 0
 
-    if self.direction == Direction.UP and y > 0:
+    if self.training:
+      # AI controlled direction
+      if np.array_equal(action, ACTION_STAY):
+        self.direction = None
+      elif np.array_equal(action, ACTION_LEFT):
+        self.direction = Direction.LEFT
+      elif np.array_equal(action, ACTION_RIGHT):
+        self.direction = Direction.RIGHT
+      elif np.array_equal(action, ACTION_DOWN):
+        self.direction = Direction.DOWN
+      elif np.array_equal(action, ACTION_UP):
+        self.direction = Direction.UP
+
+    x = self.get_player_loc().x
+    y = self.get_player_loc().y
+
+    if self.direction == Direction.UP:
       y -= BLOCK_SIZE
-    elif self.direction == Direction.LEFT and x > 0:
+    elif self.direction == Direction.LEFT:
       x -= BLOCK_SIZE
-    elif self.direction == Direction.DOWN and y < (self.h - BLOCK_SIZE):
+    elif self.direction == Direction.DOWN:
       y += BLOCK_SIZE
-    elif self.direction == Direction.RIGHT and x < (self.w - BLOCK_SIZE):
+    elif self.direction == Direction.RIGHT:
       x += BLOCK_SIZE
 
-    # can't move into bomb
-    for i in range(NUM_BOMBS):
-      if x == self.locations[i].x and y == self.locations[i].y:
-        # revert to original position
-        x = self._get_player_loc().x
-        y = self._get_player_loc().y
+    # can't move past grid boundaries or into bomb
+    if (y < 0 or y >= self.h or
+      x < 0 or x >= self.w or self.has_bomb(Point(x, y))):
+      x = self.get_player_loc().x
+      y = self.get_player_loc().y
+      reward = -5
 
     # update location
-    self.locations[len(self.locations) - 1] = Point(x, y)
-    self.direction = None
+    self.locations[-1] = Point(x, y)
+
+    if not self.training:
+      self.direction = None
+
+    return reward
 
   def _update_ui(self):
     self.display.fill(BACKGROUND)
 
     # player
-    pygame.draw.rect(self.display, BLUE, pygame.Rect(self._get_player_loc().x, self._get_player_loc().y,
+    pygame.draw.rect(self.display, BLUE, pygame.Rect(self.get_player_loc().x, self.get_player_loc().y,
       BLOCK_SIZE, BLOCK_SIZE))
 
     # bombs
@@ -208,7 +294,7 @@ class Game:
         curr_point = Point(x * BLOCK_SIZE, y * BLOCK_SIZE)
 
         color = GRID
-        if self._near_bomb(curr_point):
+        if self.near_bomb(curr_point):
           color = RED
         
         pygame.draw.rect(self.display, color, pygame.Rect(curr_point.x, curr_point.y,
@@ -227,7 +313,7 @@ class Game:
     pygame.display.flip()
 
   # returns true iff give location is touching a bomb
-  def _near_bomb(self, loc):
+  def near_bomb(self, loc):
     for bomb_loc in self.locations[0:NUM_BOMBS]:
       x_dist = abs(bomb_loc.x - loc.x)
       y_dist = abs(bomb_loc.y - loc.y)
@@ -235,12 +321,12 @@ class Game:
         return True
     return False
 
-if __name__ == '__main__':
-  game = Game()
+if __name__ == "__main__":
+  game = Game(training=False)
 
   # main game loop
   while True:
-    game_over, score = game.play_step()
+    game_over, score, reward = game.play_step([])
 
     if game_over:
       break
